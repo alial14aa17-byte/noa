@@ -1,7 +1,7 @@
-import os, json, secrets, uuid, datetime as dt, pathlib, mimetypes, urllib.request
+import os, json, secrets, uuid, datetime as dt, pathlib, mimetypes, urllib.request, io, zipfile, shutil, tempfile, hmac
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
@@ -47,10 +47,18 @@ def set_setting(db,key,value):
 def seed():
  Base.metadata.create_all(engine)
  with Session() as db:
-  if not db.query(User).filter_by(role='owner').first():
-   password=os.getenv('OWNER_PASSWORD')
-   if not password: print('WARNING: OWNER_PASSWORD missing. Owner login disabled until set.');
+  owner=db.query(User).filter_by(role='owner').first()
+  password=os.getenv('OWNER_PASSWORD')
+  if not owner:
+   if not password: print('WARNING: OWNER_PASSWORD missing. Owner login disabled until set.')
    else: db.add(User(name='المدير العام',username=os.getenv('OWNER_USERNAME','Ali'),email=os.getenv('OWNER_EMAIL','owner@example.com').lower(),password=pwd.hash(password),role='owner'))
+  elif password and not pwd.verify(password,owner.password):
+   # The deployment secret is authoritative: fixes old credentials without deleting data.
+   owner.password=pwd.hash(password)
+   print('Owner password synchronized from OWNER_PASSWORD')
+  if owner:
+   owner.username=os.getenv('OWNER_USERNAME','Ali')
+   if os.getenv('OWNER_EMAIL'):owner.email=os.getenv('OWNER_EMAIL').lower()
   if not db.query(Category).count():
    cats={}
    for name in ['هوديات','سويترات','جاكيتات','تيشيرتات','أخرى']:
@@ -253,3 +261,67 @@ def settings(request:Request,commission:int=Form(...),shipping:int=Form(...)):
   set_setting(db,'commission',commission);set_setting(db,'shipping',shipping);db.commit();return go('/manage')
 @app.get('/health')
 def health():return {'ok':True}
+
+# Complete owner-only backup. Includes hashed user credentials, orders, audit trail and uploaded images.
+BACKUP_MODELS=[User,Category,Product,Addon,Order,Setting,Ledger,History]
+def model_records(db,model):
+ return [{col.name:(getattr(row,col.name).isoformat() if isinstance(getattr(row,col.name),dt.datetime) else getattr(row,col.name)) for col in model.__table__.columns} for row in db.query(model).all()]
+
+@app.get('/manage/backup')
+def download_backup(request:Request):
+ with Session() as db:
+  auth(request,db,owner=True)
+  payload={'format':'noa-backup-v1','created_at':now().isoformat(),'tables':{model.__tablename__:model_records(db,model) for model in BACKUP_MODELS}}
+  output=io.BytesIO()
+  with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as z:
+   z.writestr('data.json',json.dumps(payload,ensure_ascii=False))
+   for f in UPLOAD.iterdir():
+    if f.is_file() and f.suffix.lower() in ('.jpg','.jpeg','.png','.webp'):
+     z.write(f,'uploads/'+f.name)
+  output.seek(0)
+  filename='noa-backup-'+now().strftime('%Y%m%d-%H%M%S')+'.zip'
+  return StreamingResponse(output,media_type='application/zip',headers={'Content-Disposition':f'attachment; filename="{filename}"','Cache-Control':'no-store'})
+
+@app.post('/manage/restore')
+async def restore_backup(request:Request,backup:UploadFile=File(...),confirm:str=Form(...)):
+ with Session() as db:auth(request,db,owner=True)
+ if confirm!='RESTORE':raise HTTPException(400,'اكتب RESTORE للتأكيد')
+ raw=await backup.read(200*1024*1024+1)
+ if len(raw)>200*1024*1024:raise HTTPException(413,'النسخة الاحتياطية أكبر من 200MB')
+ try:
+  z=zipfile.ZipFile(io.BytesIO(raw))
+  with z:
+   if len(z.infolist())>3000:raise ValueError('Too many files')
+   manifest=json.loads(z.read('data.json'))
+   if manifest.get('format')!='noa-backup-v1':raise ValueError('Invalid backup version')
+   tables=manifest['tables']
+   if set(tables)!=set(m.__tablename__ for m in BACKUP_MODELS):raise ValueError('Missing tables')
+   uploads={}
+   for item in z.infolist():
+    if item.filename.startswith('uploads/') and not item.is_dir():
+     name=item.filename[len('uploads/'):]
+     if not name or '/' in name or '\\' in name or '..' in name or pathlib.Path(name).suffix.lower() not in ('.jpg','.jpeg','.png','.webp'):raise ValueError('Invalid file name')
+     if item.file_size>8*1024*1024:raise ValueError('Image too large')
+     uploads[name]=z.read(item)
+  # Validate every table/column before touching live data.
+  for model in BACKUP_MODELS:
+   cols={c.name:c for c in model.__table__.columns}
+   if not isinstance(tables[model.__tablename__],list):raise ValueError('Invalid table')
+   for rec in tables[model.__tablename__]:
+    if not isinstance(rec,dict) or set(rec)!=set(cols):raise ValueError('Invalid record columns')
+  with Session() as db:
+   # Transactional database replacement; errors roll back all rows.
+   for model in reversed(BACKUP_MODELS):db.query(model).delete(synchronize_session=False)
+   for model in BACKUP_MODELS:
+    for rec in tables[model.__tablename__]:
+     data=dict(rec)
+     for col in model.__table__.columns:
+      if isinstance(col.type,DateTime) and data[col.name]:data[col.name]=dt.datetime.fromisoformat(data[col.name])
+     db.add(model(**data))
+    db.flush()
+   db.commit()
+  for name,content in uploads.items(): (UPLOAD/name).write_bytes(content)
+  request.session.clear()  # Require fresh authentication after restoring credentials.
+  return go('/login')
+ except (ValueError,KeyError,zipfile.BadZipFile,json.JSONDecodeError) as e:
+  raise HTTPException(400,'ملف النسخة الاحتياطية غير صالح: '+str(e))
