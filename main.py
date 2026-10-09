@@ -37,7 +37,7 @@ class History(Base):
  __tablename__='history'; id=Column(Integer,primary_key=True); order_id=Column(Integer); actor_id=Column(Integer); old=Column(String(80)); new=Column(String(80)); created=Column(DateTime,default=now)
 
 STATUS=['تم الرفع','قيد الطباعة','تم التجهيز','عند شركة التوصيل','اليوم يصل','تم التسليم','راجع','ملغي']
-ETAS={'تم الرفع':'باقي من 3 إلى 4 أيام','قيد الطباعة':'باقي من 2 إلى 3 أيام','تم التجهيز':'باقي يومين','عند شركة التوصيل':'غداً يصل','اليوم يصل':'اليوم يصل','تم التسليم':'تم التسليم','راجع':'راجع','ملغي':'ملغي'}
+ETAS={'تم الرفع':'باقي من 3 إلى 4 أيام','قيد الطباعة':'باقي من 2 إلى 3 أيام','تم التجهيز':'باقي من يوم إلى يومين','عند شركة التوصيل':'غداً يصل','اليوم يصل':'اليوم يصل','تم التسليم':'تم التسليم','راجع':'راجع','ملغي':'ملغي'}
 def setting(db,key,default=''):
  r=db.get(Setting,key); return r.value if r else default
 def set_setting(db,key,value):
@@ -64,7 +64,7 @@ def seed():
    for name in ['هوديات','سويترات','جاكيتات','تيشيرتات','أخرى']:
     c=Category(name=name);db.add(c);db.flush();cats[name]=c.id
    for name,price,cat in [('هودي ريكولر',33000,'هوديات'),('هودي أوفر سايز',35000,'هوديات'),('هودي درجة ثانية',28000,'هوديات'),('هودي سحاب بريميوم',37000,'جاكيتات'),('سويتر درجة ثانية',26000,'سويترات'),('سويتر قطن',0,'سويترات'),('هاف زيب',0,'سويترات'),('جاكيت بيسبول',0,'جاكيتات')]:
-    db.add(Product(name=name,price=price,category_id=cats[cat],colors='أسود,أبيض,وردي,أحمر,نيلي,رصاصي,جوزي,زيتوني'))
+    db.add(Product(name=name,price=price,category_id=cats[cat],colors=('نيلي,جوزي,أزرق سماوي,أحمر,أسود' if 'سويتر' in name else 'أسود,أبيض,وردي,أحمر,نيلي,رصاصي,جوزي,زيتوني')))
   if not db.query(Addon).count():
    for n,p in [('طباعة A3 إضافية',1000),('طباعة A2 إضافية',2500),('تغليف خاص',2000),('كرت إهداء',500)]:db.add(Addon(name=n,price=p))
   if not db.get(Setting,'commission'):set_setting(db,'commission','1500')
@@ -208,12 +208,48 @@ def send_telegram(o,admin_name):
   payload=urllib.parse.urlencode({'chat_id':chat,'text':msg}).encode()
   urllib.request.urlopen(urllib.request.Request(f'https://api.telegram.org/bot{token}/sendMessage',data=payload),timeout=4).read()
  except Exception as e:print('telegram notification failed',str(e))
+@app.get('/tracking',response_class=HTMLResponse)
+def tracking(request:Request,code:str=''):
+ with Session() as db:
+  u=auth(request,db)
+  o=db.query(Order).filter(func.lower(Order.code)==code.strip().lower()).first() if code.strip() else None
+  if o and u.role!='owner' and o.admin_id!=u.id:o=None
+  history=db.query(History).filter_by(order_id=o.id).order_by(History.id.asc()).all() if o else []
+  return view(request,'tracking.html',user=u,o=o,code=code,history=history,stages=STATUS[:6])
+
+@app.get('/orders/{oid}/edit',response_class=HTMLResponse)
+def edit_order_page(request:Request,oid:int):
+ with Session() as db:
+  u=auth(request,db);o=db.get(Order,oid)
+  if not o or (u.role!='owner' and o.admin_id!=u.id):raise HTTPException(404)
+  if u.role!='owner' and o.status not in ['تم الرفع','قيد الطباعة']:raise HTTPException(403,'انتهت صلاحية تعديل الطلب')
+  return view(request,'edit_order.html',user=u,o=o,products=db.query(Product).filter_by(active=True).all(),images=json.loads(o.images or '[]'))
+
+@app.post('/orders/{oid}/edit')
+def edit_order_save(request:Request,oid:int,product_id:int=Form(...),color:str=Form(''),size:str=Form(''),qty:int=Form(1),customer:str=Form(...),phone:str=Form(...),governorate:str=Form(''),area:str=Form(''),address:str=Form(''),landmark:str=Form(''),notes:str=Form(''),design_notes:str=Form(''),shipping:int=Form(0),payment_method:str=Form('cod'),paid:int=Form(0),images:list[UploadFile]=File(default=[])):
+ with Session() as db:
+  u=auth(request,db);o=db.get(Order,oid);p=db.get(Product,product_id)
+  if not o or (u.role!='owner' and o.admin_id!=u.id):raise HTTPException(404)
+  if u.role!='owner' and o.status not in ['تم الرفع','قيد الطباعة']:raise HTTPException(403,'انتهت صلاحية تعديل الطلب')
+  if not p or not p.active or not customer.strip() or not phone.strip() or qty<1 or qty>100 or shipping<0 or paid<0:raise HTTPException(400,'بيانات غير صحيحة')
+  if color and color not in p.colors.split(','):raise HTTPException(400,'لون غير متاح')
+  if size and size not in p.sizes.split(','):raise HTTPException(400,'قياس غير متاح')
+  total=p.price*qty+o.addon_total+shipping
+  if paid>total:raise HTTPException(400,'المدفوع أكبر من المجموع')
+  existing=json.loads(o.images or '[]')
+  for f in images[:max(0,15-len(existing))]:
+   fn=file_save(f)
+   if fn:existing.append(fn)
+  for key,value in {'product_id':p.id,'product_name':p.name,'product_price':p.price,'color':color,'size':size,'qty':qty,'customer':customer.strip(),'phone':phone.strip(),'governorate':governorate,'area':area,'address':address,'landmark':landmark,'notes':notes,'design_notes':design_notes,'shipping':shipping,'payment_method':payment_method,'paid':paid,'total':total,'images':json.dumps(existing)}.items():setattr(o,key,value)
+  db.add(History(order_id=o.id,actor_id=u.id,old='بيانات الطلب',new='تم تعديل التفاصيل'))
+  db.commit();return go(f'/orders/{oid}')
+
 @app.get('/orders/{oid}',response_class=HTMLResponse)
 def order_detail(request:Request,oid:int,created:int=0):
  with Session() as db:
   u=auth(request,db);o=db.get(Order,oid)
   if not o or (u.role!='owner' and o.admin_id!=u.id):raise HTTPException(404)
-  return view(request,'order_detail.html',user=u,o=o,created=created,images=json.loads(o.images or '[]'),addons=json.loads(o.addons or '[]'),admin=db.get(User,o.admin_id),history=db.query(History).filter_by(order_id=oid).order_by(History.id.desc()).all())
+  return view(request,'order_detail.html',user=u,o=o,created=created,images=json.loads(o.images or '[]'),addons=json.loads(o.addons or '[]'),admin=db.get(User,o.admin_id),history=db.query(History).filter_by(order_id=oid).order_by(History.id.desc()).all(),can_edit=(u.role=='owner' or o.status in ['تم الرفع','قيد الطباعة']))
 @app.post('/orders/{oid}/status')
 def change_status(request:Request,oid:int,status:str=Form(...)):
  with Session() as db:
