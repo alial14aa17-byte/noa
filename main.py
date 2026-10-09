@@ -163,6 +163,13 @@ def appearance_save(request:Request,headline:str=Form(''),banner:UploadFile=File
   if filename:set_setting(db,'admin_banner',filename)
   db.commit()
  return go('/manage/appearance')
+@app.post('/manage/appearance/clear')
+def clear_appearance(request:Request,key:str=Form(...)):
+ with Session() as db:
+  auth(request,db,owner=True)
+  if key!='admin_banner' and not (key.startswith('category_image_') and key[len('category_image_'):].isdigit()):raise HTTPException(400,'مفتاح غير صالح')
+  set_setting(db,key,'');db.commit()
+ return go('/manage/appearance')
 @app.post('/manage/category/{cid}/image')
 def category_image(request:Request,cid:int,image:UploadFile=File(...)):
  with Session() as db:
