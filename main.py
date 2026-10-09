@@ -134,7 +134,7 @@ def dashboard(request:Request):
   orders=q.order_by(Order.id.desc()).limit(8).all();allorders=q.all()
   earnings=sum(o.commission for o in allorders if o.status=='تم التسليم')
   paid=sum(x.amount for x in db.query(Ledger).filter_by(user_id=u.id).all()) if u.role=='admin' else 0
-  return view(request,'dashboard.html',user=u,orders=orders,total=len(allorders),delivered=sum(o.status=='تم التسليم' for o in allorders),active=sum(o.status not in ['تم التسليم','راجع','ملغي'] for o in allorders),earnings=earnings,paid=paid,commission=setting(db,'commission','1500'))
+  return view(request,'dashboard.html',user=u,orders=orders,categories=db.query(Category).filter_by(active=True).all(),products=db.query(Product).filter_by(active=True).all(),total=len(allorders),delivered=sum(o.status=='تم التسليم' for o in allorders),active=sum(o.status not in ['تم التسليم','راجع','ملغي'] for o in allorders),earnings=earnings,paid=paid,commission=setting(db,'commission','1500'),banner=setting(db,'admin_banner',''),headline=setting(db,'admin_headline','اختر القطعة وابدأ الطلب'),category_images={c.id:setting(db,'category_image_'+str(c.id),'') for c in db.query(Category).all()})
 @app.get('/orders',response_class=HTMLResponse)
 def orders_page(request:Request,status:str=''):
  with Session() as db:
@@ -145,6 +145,33 @@ def orders_page(request:Request,status:str=''):
 def new_order(request:Request):
  with Session() as db:
   u=auth(request,db);return view(request,'new_order.html',user=u,products=db.query(Product).filter_by(active=True).order_by(Product.id).all(),addons=db.query(Addon).filter_by(active=True).all(),categories=db.query(Category).filter_by(active=True).all(),shipping=int(setting(db,'shipping','5000')))
+@app.get('/sizes',response_class=HTMLResponse)
+def size_tool(request:Request):
+ with Session() as db:
+  u=auth(request,db)
+  return view(request,'sizes.html',user=u)
+@app.get('/manage/appearance',response_class=HTMLResponse)
+def appearance_page(request:Request):
+ with Session() as db:
+  u=auth(request,db,owner=True)
+  return view(request,'appearance.html',user=u,categories=db.query(Category).all(),products=db.query(Product).all(),banner=setting(db,'admin_banner',''),headline=setting(db,'admin_headline','اختر القطعة وابدأ الطلب'))
+@app.post('/manage/appearance')
+def appearance_save(request:Request,headline:str=Form(''),banner:UploadFile=File(default=None)):
+ with Session() as db:
+  auth(request,db,owner=True)
+  set_setting(db,'admin_headline',headline[:120]); filename=file_save(banner)
+  if filename:set_setting(db,'admin_banner',filename)
+  db.commit()
+ return go('/manage/appearance')
+@app.post('/manage/category/{cid}/image')
+def category_image(request:Request,cid:int,image:UploadFile=File(...)):
+ with Session() as db:
+  auth(request,db,owner=True);c=db.get(Category,cid)
+  if not c:raise HTTPException(404)
+  filename=file_save(image)
+  if filename:set_setting(db,'category_image_'+str(cid),filename)
+  db.commit()
+ return go('/manage/appearance')
 @app.post('/orders/new')
 def create_order(request:Request,product_id:int=Form(...),color:str=Form(''),size:str=Form(''),qty:int=Form(1),customer:str=Form(...),phone:str=Form(...),governorate:str=Form(''),area:str=Form(''),address:str=Form(''),landmark:str=Form(''),notes:str=Form(''),design_notes:str=Form(''),shipping:int=Form(0),payment_method:str=Form('cod'),paid:int=Form(0),addons:str=Form('[]'),images:list[UploadFile]=File(default=[])):
  with Session() as db:
