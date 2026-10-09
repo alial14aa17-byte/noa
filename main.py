@@ -81,14 +81,23 @@ scheduler=BackgroundScheduler(timezone='UTC')
 async def lifespan(app):
  seed();scheduler.add_job(advance,'interval',minutes=5,id='auto_status',replace_existing=True);scheduler.start();yield;scheduler.shutdown(wait=False)
 app=FastAPI(lifespan=lifespan)
-secret=os.getenv('SESSION_SECRET') or secrets.token_urlsafe(32)
+secret=os.getenv('SESSION_SECRET')
+if not secret or len(secret)<32:
+ raise RuntimeError('SESSION_SECRET must be set in Railway Variables (minimum 32 characters) to keep login sessions valid across workers and deployments')
 app.add_middleware(SessionMiddleware,secret_key=secret,https_only=os.getenv('SECURE_COOKIES','false').lower()=='true',same_site='lax',max_age=604800)
 app.mount('/static',StaticFiles(directory=str(BASE/'static')),name='static')
 tpl=Jinja2Templates(directory=str(BASE/'templates'))
+@app.exception_handler(401)
+async def unauthenticated(request:Request,exc:HTTPException):
+ if request.method=='GET' and 'text/html' in request.headers.get('accept',''):
+  return go('/login')
+ return JSONResponse({'detail':exc.detail},status_code=401)
 tpl.env.filters['money']=lambda x:f'{int(x or 0):,}'
 def auth(request,db,owner=False):
  uid=request.session.get('uid');u=db.get(User,uid) if uid else None
- if not u or not u.active or (owner and u.role!='owner'):raise HTTPException(403,'غير مصرح')
+ if not u or not u.active:
+  raise HTTPException(401,'انتهت جلسة الدخول. سجل الدخول مجدداً')
+ if owner and u.role!='owner':raise HTTPException(403,'غير مصرح')
  return u
 def view(request,name,**kw):return tpl.TemplateResponse(request,name,{'request':request,'statuses':STATUS,'etas':ETAS,**kw})
 def go(path):return RedirectResponse(path,status_code=303)
